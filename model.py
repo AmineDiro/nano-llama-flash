@@ -12,7 +12,7 @@ class ModelConfig:
     n_layers: int = 32
     n_heads: int = 32
     n_kv_heads: int | None = None
-    vocab_size: int = -1
+    vocab_size: int = 32758
 
     # RMSNorm param
     eps_norm: float = 1e-5
@@ -74,7 +74,7 @@ class RMSNorm(torch.nn.Module):
 
     def forward(self, x: torch.Tensor):
         norm_x = x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
-        return norm_x * self.weigth  # type: ignore
+        return norm_x * self.weight
 
 
 class MLP(torch.nn.Module):
@@ -192,8 +192,8 @@ class TransformerBlock(torch.nn.Module):
         self.mlp = MLP(config.dim, 4 * config.dim)
         self.mlp_norm = RMSNorm(config.dim, config.eps_norm)
 
-    def forward(self, x, pos, freqs_cis):
-        x = x + self.attention(self.attn_norm(x), pos, freqs_cis)
+    def forward(self, x, pos, freqs_cis, mask):
+        x = x + self.attention(self.attn_norm(x), pos, freqs_cis, mask)
         x = x + self.mlp(self.mlp_norm(x))
         return x
 
@@ -237,6 +237,14 @@ class Transformer(torch.nn.Module):
             )  #  -inf will be set 0 in softmax
             mask = torch.triu(mask, diagonal=1)
             # TODO:scores  matrice will be of shape : (S, S + cache_len). Maybe stack if prefill with kv cache
+            # When performing KV caching, we compute the attention scores
+            # only for the new sequence. Thus, the matrix of scores is of size
+            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+            # j > cache_len + i, since row i corresponds to token cache_len + i.
+            # mask = torch.hstack(
+            #     [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
+            # ).type_as(h)
+            mask = mask.type_as(x)
 
         for layer in self.layers:
             x = layer(x, pos, freqs_cis, mask)

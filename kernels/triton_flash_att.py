@@ -1,6 +1,6 @@
 import math
-from typing import Any
 
+from typing import Any
 import torch.nn.functional as F
 import torch
 import triton
@@ -49,14 +49,15 @@ def attn_kernel(
     # offset the batch*N_h, for each dim, skip to the next dim
     for j in range(0, Tc):
         # Load K_j, V_j from HBM to SRAM
-        offset_j = (j * Bc + tl.arange(0, Bc))[:,None] + tl.arange(0, D)[None,:]
+        # NOTE: STUPID mistake! the stride
+        offset_j = (j * Bc + tl.arange(0, Bc))[:,None]*D + tl.arange(0, D)[None,:]
         kj = tl.load(k_ptr + offset_j)  # shape(Bc,Bc)
         vj = tl.load(v_ptr + offset_j)  # shape(Bc,Bc)
 
         for i in range(0, Tr):
             # Load Q_i, O_i, l_i, m_i from HBM to SRAM
             S_i_offset = i * Bc + tl.arange(0, Bc)
-            offset_i = (S_i_offset)[:,None] + tl.arange(0, D)[None,:]
+            offset_i = (S_i_offset)[:,None]*D + tl.arange(0, D)[None,:]
 
             prev_oi = tl.load(o_ptr + offset_i)
             prev_li = tl.load(l_ptr + S_i_offset)
@@ -129,8 +130,8 @@ def main():
 
     compute_sram_need(Br,Bc,D_h)
 
-    # NOTE: 
-    attn_kernel[(B, N_h)](q, v, k, o, S, D_h, Tc, Tr, Bc, Br, 1/math.sqrt(D_h), l, m)
+    # NOTE:
+    attn_kernel[(B, N_h)](q, k, v, o, S, D_h, Tc, Tr, Bc, Br, 1/math.sqrt(D_h), l, m)
  
     o_simple= simple_attn(q,k,v)
 

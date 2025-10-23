@@ -111,8 +111,8 @@ def compute_sram_need(Br,Bc,D_h):
 
 def main():
 
-    B = 1  # 16
-    N_h = 2  # 12
+    B = 512
+    N_h = 64
     S = 64
     D_h = 64
 
@@ -131,13 +131,22 @@ def main():
     compute_sram_need(Br,Bc,D_h)
 
     # NOTE:
-    attn_kernel[(B, N_h)](q, k, v, o, S, D_h, Tc, Tr, Bc, Br, 1/math.sqrt(D_h), l, m)
- 
-    o_simple= simple_attn(q,k,v)
+    print('=== profiling flash attention ===')
+    # simple_time = triton.testing.do_bench(lambda: attn_kernel[(B, N_h)](q, k, v, o, S, D_h, Tc, Tr, Bc, Br, 1/math.sqrt(D_h), l, m), rep = 400)
+    # print(f"Flash attention : {simple_time*1000:.2f}us")
 
-    # Check if the results are the same
-    print(o[0,0,0,:])
-    print(o_simple[0,0,0,:])
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        attn_kernel[(B, N_h)](q, k, v, o, S, D_h, Tc, Tr, Bc, Br, 1/math.sqrt(D_h), l, m)
+    print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
+
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    print('=== profiling reference simple attention ===')
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        o_simple= simple_attn(q,k,v)
+    print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
+
     assert torch.allclose(o, o_simple,atol=1e-5, rtol=1e-5)
 
 

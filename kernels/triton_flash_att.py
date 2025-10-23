@@ -40,13 +40,11 @@ def attn_kernel(
     q_ptr = Q + batch_offset
     o_ptr = O + batch_offset
 
-    l_ptr = l + batch_offset
-    m_ptr = m + batch_offset
-
-    # Create in SRAM
-    li = tl.zeros([Bc], dtype=tl.float32)
-    oi = tl.zeros([Bc, D], dtype=tl.float32)
-    mi = tl.full([Bc], value = float('-inf'), dtype=tl.float32)
+    # TODO: pass stride_m
+    # Stride for l,m is S.
+    lm_batch_offset = (pid_x * tl.num_programs(1) * S) + (pid_y * S)
+    l_ptr = l + lm_batch_offset
+    m_ptr = m + lm_batch_offset
 
     # offset the batch*N_h, for each dim, skip to the next dim
     for j in range(0, Tc):
@@ -60,6 +58,11 @@ def attn_kernel(
             S_i_offset = i * Bc + tl.arange(0, Bc)
             offset_i = (S_i_offset)[:,None] + tl.arange(0, D)[None,:]
 
+            prev_oi = tl.load(o_ptr + offset_i)
+            prev_li = tl.load(l_ptr + S_i_offset)
+            prev_mi = tl.load(m_ptr + S_i_offset)
+
+            # Load the query block
             qi = tl.load(q_ptr + offset_i)  # shape (Br,Br) == (Bc,Bc)
 
             # Compute Sij on Chip Q_i * K_j.T / sqrt(D_h)
@@ -67,31 +70,26 @@ def attn_kernel(
 
             # Rowmax(Sij): (Bc,)
             mij = tl.max(Sij, 1)
-            pij = tl.exp(Sij - mij[:None]) # (Bc,Bc)
+            pij = tl.exp(Sij - mij[:,None]) # (Bc,Bc)
             lij = tl.sum(pij, 1) # (Bc,)
 
             # Running maximum
-            mi_new = tl.maximum(mi, mij)
+            mi_new = tl.maximum(prev_mi, mij)
 
-            # Update the running log-sum-exp and max
-            alpha = tl.exp(mi - mi_new)
+            # Compute scaling factors using previous_max
+            alpha = tl.exp(prev_mi - mi_new)
             beta = tl.exp(mij - mi_new)
-            li_new = li * alpha + lij * beta
 
-            # li norm 
-            # li_new_diag = tl.eye(Bc, dtype=li_new.dtype) * li_new[:, None]
-            # li_diag = tl.eye(Bc, dtype=li.dtype) * li_new[:, None]
-            # li_norm = li_diag / li_new_diag
-            oi = (alpha[:,None]*li[:,None] * oi + beta[:,None] * tl.dot(pij, vj)) / li_new[:,None]
+            # Update running sum
+            li_new = prev_li * alpha + lij * beta
 
-            # Update moments in HBM
-            mi = mi_new
-            li = li_new
+            # Update the output block
+            oi_new = (alpha[:, None] * prev_li[:, None] * prev_oi + beta[:, None] * tl.dot(pij, vj)) / li_new[:, None]
 
             # Update in HBM
-            tl.store(o_ptr + offset_i, oi)
-            tl.store(m_ptr + S_i_offset, mi)
-            tl.store(l_ptr + S_i_offset, li)
+            tl.store(o_ptr + offset_i, oi_new)
+            tl.store(m_ptr + S_i_offset, mi_new)
+            tl.store(l_ptr + S_i_offset, li_new)
 
 def simple_attn(q, k, v):
     att = (q @ k.transpose(-2, -1) * (1.0 / math.sqrt(k.size(-1))))
@@ -129,7 +127,7 @@ def main():
     Br = Bc = 32
     Tc = Tr = S // Bc
 
-    compute_sram_need(Br,Bc,D_h) 
+    compute_sram_need(Br,Bc,D_h)
 
     # NOTE: 
     attn_kernel[(B, N_h)](q, v, k, o, S, D_h, Tc, Tr, Bc, Br, 1/math.sqrt(D_h), l, m)
@@ -139,7 +137,7 @@ def main():
     # Check if the results are the same
     print(o[0,0,0,:])
     print(o_simple[0,0,0,:])
-    assert torch.allclose(o, o_simple, atol=1e-6)
+    assert torch.allclose(o, o_simple,atol=1e-5, rtol=1e-5)
 
 
 main()

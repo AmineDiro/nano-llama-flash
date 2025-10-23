@@ -80,14 +80,12 @@ def _attn_fwd_inner(
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
             qk = qk * sm_scale + tl.where(mask, 0, -1.0e6)
 
-            # Update running max for numerical stability.
-            m_ij = tl.maximum(m_i, tl.max(qk, 1))
-            qk -= m_ij[:, None]
         else:
             qk = qk * sm_scale
-            # Update running max for numerical stability.
-            m_ij = tl.maximum(m_i, tl.max(qk, 1))
-            qk -= m_ij[:, None]
+
+        # Update running max for numerical stability.
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        qk -= m_ij[:, None]
 
         p = tl.math.exp2(qk)
 
@@ -182,8 +180,8 @@ def _attn_fwd(
 
     # Initialize statistics and accumulator.
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
 
     # Load the Q block, which will be reused.
     q = tl.load(Q_block_ptr)

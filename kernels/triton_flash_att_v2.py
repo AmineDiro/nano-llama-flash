@@ -10,6 +10,15 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
 # NOTE: (@aminediro): This is based on the FlashAttention1 paper
+#
+@triton.autotune(
+    configs=[
+        triton.Config({"Bc": 16}, num_stages=3, num_warps=8),
+        triton.Config({"Bc": 32}, num_stages=4, num_warps=1),
+        triton.Config({"Bc": 32}, num_stages=4, num_warps=4),
+    ],
+    key=["D", "S"],
+)
 @triton.jit
 def attn_kernel(
     Q,
@@ -17,34 +26,30 @@ def attn_kernel(
     V,
     O,
     S,
+    stride_H,
+    softmax_scale,
     D: tl.constexpr,
     Tc: tl.constexpr,
-    Tr: tl.constexpr,
     Bc: tl.constexpr,
-    Br: tl.constexpr,
-    softmax_scale,
-    l,
-    m,
 ):
-    # We have Br threads for this program
     # Get the thread index
-    pid_x = tl.program_id(0)
     pid_y = tl.program_id(1)
-
-    # TODO: could do this using strides q.stride(1)
-    # pass stride_q as arg
-    batch_offset = (pid_x * tl.num_programs(1) * S * D) + (pid_y * S * D)
-
+    batch_offset = pid_y * stride_H # skip batch,head offset: idx*B*N_h
+    q_ptr = Q + batch_offset
     k_ptr = K + batch_offset
     v_ptr = V + batch_offset
-    q_ptr = Q + batch_offset
     o_ptr = O + batch_offset
 
-    # TODO: pass stride_m
-    # Stride for l,m is S.
-    lm_batch_offset = (pid_x * tl.num_programs(1) * S) + (pid_y * S)
-    l_ptr = l + lm_batch_offset
-    m_ptr = m + lm_batch_offset
+    # Loading Query block (Bc,D)
+    pid_x = tl.program_id(0)
+    S_i_offset = pid_x * Bc * D + tl.arange(0, Bc) * D  # D is the stride
+    offset_i = (S_i_offset)[:, None] + tl.arange(0, D)[None, :]
+    qi = tl.load(q_ptr + offset_i)  # shape (Br,Br) == (Bc,Bc)
+
+    # Block accumulator and running max
+    prev_li = tl.zeros([Bc], dtype=tl.float32)
+    prev_mi = tl.zeros([Bc], dtype=tl.float32) - float("inf")
+    acc = tl.zeros([Bc, D], dtype=tl.float32)
 
     # offset the batch*N_h, for each dim, skip to the next dim
     for j in range(0, Tc):
@@ -55,46 +60,39 @@ def attn_kernel(
         vj = tl.load(v_ptr + offset_j)  # shape(Bc,Bc)
 
         # TODO: Run parallel loop
-        for i in range(0, Tr):
-            # Load Q_i, O_i, l_i, m_i from HBM to SRAM
-            S_i_offset = i * Bc + tl.arange(0, Bc)
-            offset_i = (S_i_offset)[:, None] * D + tl.arange(0, D)[None, :]
+        # Compute Sij on Chip Q_i * K_j.T / sqrt(D_h)
+        Sij = tl.dot(qi, tl.trans(kj)) * softmax_scale  # (Bc,Br) == (Bc,Bc)
 
-            prev_oi = tl.load(o_ptr + offset_i)
-            prev_li = tl.load(l_ptr + S_i_offset)
-            prev_mi = tl.load(m_ptr + S_i_offset)
+        # Rowmax(Sij): (Bc,)
+        mij = tl.max(Sij, 1)
+        pij = tl.exp(Sij - mij[:, None])  # (Bc,Bc)
+        lij = tl.sum(pij, 1)  # (Bc,)
 
-            # Load the query block
-            qi = tl.load(q_ptr + offset_i)  # shape (Br,Br) == (Bc,Bc)
+        # Running maximum
+        mi_new = tl.maximum(prev_mi, mij)
 
-            # Compute Sij on Chip Q_i * K_j.T / sqrt(D_h)
-            Sij = tl.dot(qi, tl.trans(kj)) * softmax_scale  # (Bc,Br) == (Bc,Bc)
+        # Compute scaling factors using previous_max
+        alpha = tl.exp(prev_mi - mi_new)
+        beta = tl.exp(mij - mi_new)
 
-            # Rowmax(Sij): (Bc,)
-            mij = tl.max(Sij, 1)
-            pij = tl.exp(Sij - mij[:, None])  # (Bc,Bc)
-            lij = tl.sum(pij, 1)  # (Bc,)
+        # Update running sum
+        li_new = prev_li * alpha + lij * beta
 
-            # Running maximum
-            mi_new = tl.maximum(prev_mi, mij)
+        # Update the output block
+        acc = (
+            alpha[:, None] * prev_li[:, None] * acc
+            + beta[:, None] * tl.dot(pij, vj)
+        ) / li_new[:, None]
 
-            # Compute scaling factors using previous_max
-            alpha = tl.exp(prev_mi - mi_new)
-            beta = tl.exp(mij - mi_new)
-
-            # Update running sum
-            li_new = prev_li * alpha + lij * beta
-
-            # Update the output block
-            oi_new = (
-                alpha[:, None] * prev_li[:, None] * prev_oi
-                + beta[:, None] * tl.dot(pij, vj)
-            ) / li_new[:, None]
-
-            # Update in HBM
-            tl.store(o_ptr + offset_i, oi_new)
-            tl.store(m_ptr + S_i_offset, mi_new)
-            tl.store(l_ptr + S_i_offset, li_new)
+        prev_li = li_new
+        prev_mi = mi_new
+    
+    # Update in HBM
+    tl.store(o_ptr + offset_i, acc)
+    
+    # TODO: maybe we need to store this for the backprop
+    # tl.store(m_ptr + S_i_offset, mi_new)
+    # tl.store(l_ptr + S_i_offset, li_new)
 
 
 def simple_attn(q, k, v):
@@ -117,10 +115,10 @@ def compute_sram_need(Br, Bc, D_h):
 
 
 def main():
-    B = 512
-    N_h = 64
+    B = 10
+    N_h = 32
     S = 64
-    D_h = 64
+    D_h = 128
 
     q = torch.randn(B, N_h, S, D_h).cuda()
     v = torch.randn(B, N_h, S, D_h).cuda()
@@ -132,7 +130,7 @@ def main():
 
     # flash attn block size
     Br = Bc = 32
-    Tc = Tr = S // Bc
+    Tc = Tr = S // Bc  # NOTE: S%Br == 0
 
     compute_sram_need(Br, Bc, D_h)
 
@@ -144,9 +142,11 @@ def main():
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CUDA]
     ) as prof:
-        attn_kernel[(B, N_h)](
-            q, k, v, o, S, D_h, Tc, Tr, Bc, Br, 1 / math.sqrt(D_h), l, m
+        grid = lambda META: (triton.cdiv(S, META["Bc"]), B * N_h)
+        attn_kernel[grid](
+            q, k, v, o, S, q.stride(1), 1 / math.sqrt(D_h), D_h, Tc
         )
+
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
     torch.cuda.empty_cache()
@@ -157,9 +157,9 @@ def main():
         activities=[torch.profiler.ProfilerActivity.CUDA]
     ) as prof:
         o_simple = simple_attn(q, k, v)
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
-    assert torch.allclose(o, o_simple, atol=1e-5, rtol=1e-5)
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    assert torch.allclose(o, o_simple, atol=1e-6, rtol=1e-6)
 
 
 main()

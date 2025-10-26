@@ -215,7 +215,7 @@ class Transformer(torch.nn.Module):
 
         # RoPe setup
         self.freqs_cis = precompute_freqs_cis(
-            config.dim // config.n_heads,
+            config.dim // config.n_heads,  # D_h head dim
             config.max_seq_len * 2,
             config.rope_theta,
         )

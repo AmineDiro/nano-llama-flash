@@ -1,13 +1,14 @@
 """
-FA1 implementation 
-Issues: 
-- Block Size Too Small (Bc=32) With Bc=32 and S=8192, you're doing 256 iterations of the loop. -> Large 
+FA1 implementation
+Issues:
+- Block Size Too Small (Bc=32) With Bc=32 and S=8192, you're doing 256 iterations of the loop. -> Large
 - At S=8192, cuBLAS is simply faster. Flash Attention's advantage appears when S > 16K. Memory bandwidth becomes the bottleneck
 - Missing Br Parameter: same block size for both rows (Q) and columns (K/V). The original FA1 uses different block. Typically Br should be larger than Bc for better performance.
 
 WINs:
 - At large S (> 4096) on RTX2070 Super, only the FA works. Torch OOMs
 """
+
 import math
 
 from typing import Any
@@ -20,13 +21,15 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
 # NOTE: (@aminediro): This is based on the FlashAttention1 paper
-# Bc=32, num_warps=4 best found params
+# Bc: 32, num_warps: 4, num_ctas: 1, num_stages: 4, maxnreg: None
 # @triton.autotune(
 #     configs=[
+#         triton.Config({"Bc": 32}, num_stages=4, num_warps=32),
 #         triton.Config({"Bc": 32}, num_stages=4, num_warps=4),
 #         triton.Config({"Bc": 32}, num_stages=4, num_warps=8),
 #         triton.Config({"Bc": 64}, num_stages=1, num_warps=4),
 #         triton.Config({"Bc": 128}, num_stages=4, num_warps=4),
+#         triton.Config({"Bc": 16}, num_stages=4, num_warps=4),
 #     ],
 #     key=["D", "S"],
 # )
@@ -45,7 +48,7 @@ def attn_kernel(
 ):
     # Get the thread index
     pid_y = tl.program_id(1)
-    batch_offset = pid_y * stride_H # skip batch,head offset: idx*B*N_h
+    batch_offset = pid_y * stride_H  # skip batch,head offset: idx*B*N_h
     q_ptr = Q + batch_offset
     k_ptr = K + batch_offset
     v_ptr = V + batch_offset
@@ -56,7 +59,9 @@ def attn_kernel(
     S_i_offset = pid_x * Bc * D + tl.arange(0, Bc) * D  # D is the stride
     offset_i = (S_i_offset)[:, None] + tl.arange(0, D)[None, :]
     mask = (pid_x * Bc + tl.arange(0, Bc)) < S
-    qi = tl.load(q_ptr + offset_i, mask = mask[:,None], other=0.0)  # shape (Br,Br) == (Bc,Bc)
+    qi = tl.load(
+        q_ptr + offset_i, mask=mask[:, None], other=0.0
+    )  # shape (Br,Br) == (Bc,Bc)
 
     # Block accumulator and running max
     prev_li = tl.zeros([Bc], dtype=tl.float32)
@@ -71,8 +76,8 @@ def attn_kernel(
         kj = tl.load(k_ptr + offset_j)  # shape(Bc,Bc)
         vj = tl.load(v_ptr + offset_j)  # shape(Bc,Bc)
 
-        # TODO: Run parallel loop
         # Compute Sij on Chip Q_i * K_j.T / sqrt(D_h)
+        # TODO: Run parallel loop
         Sij = tl.dot(qi, tl.trans(kj)) * softmax_scale  # (Bc,Br) == (Bc,Bc)
 
         # Rowmax(Sij): (Bc,)
@@ -91,15 +96,15 @@ def attn_kernel(
         li_new = prev_li * alpha + lij * beta
 
         # Update the output block
-        acc = alpha[:, None]* acc + beta[:, None] * tl.dot(pij, vj) 
+        acc = alpha[:, None] * acc + beta[:, None] * tl.dot(pij, vj)
 
         prev_li = li_new
         prev_mi = mi_new
-    
-    acc = acc/ prev_li[:,None]
+
+    acc = acc / prev_li[:, None]
     # Update in HBM
     tl.store(o_ptr + offset_i, acc)
-    
+
     # TODO: maybe we need to store this for the backprop
     # tl.store(m_ptr + S_i_offset, mi_new)
     # tl.store(l_ptr + S_i_offset, li_new)
@@ -125,10 +130,10 @@ def compute_sram_need(Br, Bc, D_h):
 
 
 def main():
-    B = 12
-    N_h = 16
-    S = 4096
-    D_h = 32
+    B = 2
+    N_h = 2
+    S = 512
+    D_h = 64
 
     q = torch.randn(B, N_h, S, D_h).cuda()
     v = torch.randn(B, N_h, S, D_h).cuda()
@@ -136,9 +141,9 @@ def main():
     o = torch.zeros_like(q)
 
     l = torch.zeros(B, N_h, S).cuda()
+    # flash attn block size
     m = torch.full((B, N_h, S), float("-inf")).cuda()
 
-    # flash attn block size
     Br = Bc = 32
     Tc = Tr = S // Bc  # NOTE: S%Br == 0
 
@@ -146,38 +151,50 @@ def main():
 
     # NOTE:
     print("=== profiling flash attention ===")
-    # simple_time = triton.testing.do_bench(lambda: attn_kernel[(B, N_h)](q, k, v, o, S, D_h, Tc, Tr, Bc, Br, 1/math.sqrt(D_h), l, m), rep = 400)
-    # print(f"Flash attention : {simple_time*1000:.2f}us")
+    grid = lambda META: (triton.cdiv(S, META["Bc"]), B * N_h)  # block size (1,192, 1)
 
-    grid = lambda META: (triton.cdiv(S, META["Bc"]), B * N_h)
-    
-    # NOTE: autotune best config
+    # # NOTE: autotune best config
     # _ = attn_kernel[grid](
-    #         q, k, v, o, S, q.stride(1), 1 / math.sqrt(D_h), D_h, Tc, Bc
-    #     )
+    #     q,
+    #     k,
+    #     v,
+    #     o,
+    #     S,
+    #     q.stride(1),
+    #     1 / math.sqrt(D_h),
+    #     D_h,
+    #     Tc,
+    # )
     # print("Programmatically retrieved best config:")
     # print(attn_kernel.best_config)
+    # return
 
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA]
-    ) as prof:
-        attn_kernel[grid](
-            q, k, v, o, S, q.stride(1), 1 / math.sqrt(D_h), D_h, Tc, Bc
-        )
-
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-
+    out = attn_kernel[grid](
+        q,
+        k,
+        v,
+        o,
+        S,
+        q.stride(1),
+        1 / math.sqrt(D_h),
+        D_h,
+        Tc,
+        Bc,
+        num_ctas=1,
+        num_warps=32,
+        num_stages=4,
+    )
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
-    print("=== profiling reference simple attention ===")
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA]
-    ) as prof:
-        o_simple = simple_attn(q, k, v)
-
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-    assert torch.allclose(o, o_simple, atol=1e-6, rtol=1e-6)
+    # print("=== profiling reference simple attention ===")
+    # with torch.profiler.profile(
+    #     activities=[torch.profiler.ProfilerActivity.CUDA]
+    # ) as prof:
+    #     o_simple = simple_attn(q, k, v)
+    #
+    # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    # assert torch.allclose(o, o_simple, atol=1e-6, rtol=1e-6)
 
 
 main()

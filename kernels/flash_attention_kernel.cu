@@ -14,12 +14,11 @@ __global__ void flash_attention_kernel(
     float* O,
     int S,           // Sequence length
     int stride_H,    // Stride between heads
-    float softmax_scale,
     int D,           // Head dimension
+    float softmax_scale,
     int Tc,          // Number of K/V tiles (S / Bc)
     int Bc           // Block size
 ) {
-    // Get block indices - same as tl.program_id()
     int pid_x = blockIdx.x;  // Q block index
     int pid_y = blockIdx.y;  // batch * head index
     int tid = threadIdx.x;   // Thread index within block
@@ -37,20 +36,21 @@ __global__ void flash_attention_kernel(
     float* kj = smem + Bc * D;           // [Bc][D]
     float* vj = smem + 2 * Bc * D;       // [Bc][D]
     float* Sij = smem + 3 * Bc * D;      // [Bc][Bc]
+    float* prev_mi = smem + 3 * Bc * D + Bc * Bc;  // [Bc]
+    float* prev_li = smem + 3 * Bc * D + Bc * Bc + Bc;  // [Bc]
+    float* acc = smem + 3 * Bc * D + Bc * Bc + 2 * Bc;  // [Bc][D]
+    float* mij = smem + 3 * Bc * D + Bc * Bc + 2 * Bc + Bc * D;  // [Bc]
+    float* lij = smem + 3 * Bc * D + Bc * Bc + 2 * Bc + Bc * D + Bc;  // [Bc]
 
-    // Register arrays for running statistics (per thread)
-    float prev_mi[32];  // Assuming Bc <= 32 for simplicity
-    float prev_li[32];
-    float acc[32][128];
-
-    // Initialize running statistics
-    for (int i = 0; i < Bc; i++) {
+    // Initialize running statistics cooperatively
+    for (int i = tid; i < Bc; i += blockDim.x) {
         prev_mi[i] = -INFINITY;
         prev_li[i] = 0.0f;
-        for (int d = 0; d < D; d++) {
-            acc[i][d] = 0.0f;
-        }
     }
+    for (int idx = tid; idx < Bc * D; idx += blockDim.x) {
+        acc[idx] = 0.0f;
+    }
+    __syncthreads();
 
     // Load Query block Q_i: shape (Bc, D)
     // Each thread loads multiple elements cooperatively
@@ -116,9 +116,6 @@ __global__ void flash_attention_kernel(
         // Compute row-wise max and softmax statistics
         // Each thread handles one or more rows
         // TODO: Optimize with warp shuffle intrinsics later
-        float mij[32];
-        float lij[32];
-
         for (int row = tid; row < Bc; row += blockDim.x) {
             // Row-wise max
             float row_max = -INFINITY;
@@ -153,7 +150,7 @@ __global__ void flash_attention_kernel(
             // Update accumulator: acc = alpha * acc + beta * P_ij @ V_j
             // First scale existing accumulator
             for (int d = 0; d < D; d++) {
-                acc[row][d] *= alpha;
+                acc[row * D + d] *= alpha;
             }
             // Add beta * P_ij @ V_j
 
@@ -162,7 +159,7 @@ __global__ void flash_attention_kernel(
                 for (int col = 0; col < Bc; col++) {
                     sum += Sij[row * Bc + col] * vj[col * D + d];
                 }
-                acc[row][d] += beta * sum;
+                acc[row * D + d] += beta * sum;
             }
 
             // Update running statistics
@@ -179,7 +176,7 @@ __global__ void flash_attention_kernel(
         int global_row = q_row_start + row;
 
         if (global_row < S) {
-            float normalized = acc[row][col] / prev_li[row];
+            float normalized = acc[row * D + col] / prev_li[row];
             o_ptr[global_row * D + col] = normalized;
         }
     }
@@ -187,19 +184,19 @@ __global__ void flash_attention_kernel(
     __syncthreads();
 }
 
-// Kernel launcher function (called from C++ wrapper)
 torch::Tensor flash_attn_forward(
     torch::Tensor Q,
     torch::Tensor K,
     torch::Tensor V,
-    int B,
-    int N_h,
-    int S,
-    int D,
-    int Bc
+    const int Bc
 ) {
-    int Tc = (S + Bc - 1) / Bc;  // Number of tiles
-    int stride_H = S * D;        // Stride between heads
+    const int B = Q.size(0);
+    const int N_h = Q.size(1);
+    const int S = Q.size(2);
+    const int D = Q.size(3);
+    int Tc = (S + Bc - 1) / Bc;  // Number of tiles == Tr
+
+    int stride_H = Q.stride(1);
     float softmax_scale = 1.0f / sqrtf((float)D);
     dim3 grid((S + Bc - 1) / Bc, B * N_h, 1);
 
@@ -209,15 +206,23 @@ torch::Tensor flash_attn_forward(
     // Block: Bc threads per block
     dim3 block(Bc, 1, 1);
 
-
     // Shared memory size: 3 * Bc * D (for qi, kj, vj) + Bc * Bc (for Sij)
-    size_t smem_size = (3 * Bc * D + Bc * Bc) * sizeof(float);
+    //                   + Bc (prev_mi) + Bc (prev_li) + Bc * D (acc) + Bc (mij) + Bc (lij)
+    size_t smem_size = (4 * Bc * D + Bc * Bc + 4 * Bc) * sizeof(float);
 
     flash_attention_kernel<<<grid, block, smem_size>>>(
-        Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(), O.data_ptr<float>(),
-        S, stride_H, softmax_scale,
-        D, Tc, Bc
+        Q.data_ptr<float>(), 
+        K.data_ptr<float>(), 
+        V.data_ptr<float>(), 
+        O.data_ptr<float>(),
+        S,
+        stride_H, 
+        D, 
+        softmax_scale,
+        Tc, 
+        Bc
     );
+
 
     return O;
 

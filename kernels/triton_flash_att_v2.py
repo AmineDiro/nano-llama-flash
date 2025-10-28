@@ -130,10 +130,10 @@ def compute_sram_need(Br, Bc, D_h):
 
 
 def main():
-    B = 2
-    N_h = 2
+    B = 10
+    N_h = 64
     S = 512
-    D_h = 64
+    D_h = 128
 
     q = torch.randn(B, N_h, S, D_h).cuda()
     v = torch.randn(B, N_h, S, D_h).cuda()

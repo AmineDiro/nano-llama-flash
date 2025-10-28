@@ -10,7 +10,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 # JIT compile the CUDA extension
 print("Compiling CUDA extension...")
 cuda_module = load(
-    name="flash_attention_cuda",
+    name="flash_attention_cuda_v2",
     sources=[
         os.path.join(current_dir, "flash_attention_wrapper.cpp"),
         os.path.join(current_dir, "flash_attention_kernel.cu"),
@@ -18,6 +18,8 @@ cuda_module = load(
     extra_cuda_cflags=[
         "-O2",
         "--use_fast_math",
+        "-lineinfo",  # Line-level profiling info for NCU
+        "-g",  # Debug symbols
     ],
     verbose=True,
 )
@@ -62,10 +64,10 @@ def test_flash_attention():
     print("Testing Flash Attention CUDA Implementation")
 
     # Test parameters
-    B = 2
-    N_h = 2
-    S = 128
-    D_h = 64
+    B = 1
+    N_h = 16
+    S = 512
+    D_h = 33
     Bc = 32
 
     # Check SRAM requirements
@@ -79,13 +81,9 @@ def test_flash_attention():
 
     # Run CUDA kernel
     print(f"\nRunning CUDA Flash Attention kernel...")
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA]
-    ) as prof:
-        o_cuda = flash_attention(q, k, v, Bc)
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
     torch.cuda.synchronize()
-    return
+    o_cuda = flash_attention(q, k, v, Bc)
+    torch.cuda.synchronize()
 
     # Run reference implementation
     print(f"\nRunning reference PyTorch attention...")

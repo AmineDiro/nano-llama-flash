@@ -39,7 +39,6 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
-# TODO: Learn about RoPE here
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
     assert 0 <= 1 < ndim
@@ -48,19 +47,30 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     return freqs_cis.view(*shape)
 
 
-# TODO(@amindiro): implement
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    # NOTE:
+    # recompute frequencies : 1 / (theta^ (2*p / dim))  where p is the position
+    freqs = 1.0 / (
+        theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)
+    )  # [ D_h//2]
     t = torch.arange(end, device=freqs.device, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    freqs = torch.outer(t, freqs)  # [ end , D_h//2]
+    # The change to complex:  freqs_cis[i] = 1*cos(freqs[i])+ j.1*sin(freqs[i])
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
 
 
 def apply_rotary_emb(xq, xk, freqs_cis) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    # NOTE:xq is of shape [ B, T, N_h, D_h]
+    xq_ = torch.view_as_complex(
+        xq.float().reshape(*xq.shape[:-1], -1, 2)
+    )  # [B,T, N_h, D_h//2, 2]
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)  # [1 , T, 1, D_h//2]
+    # Compute the R(q) Rope Transform is complex
+    # xq_out = xq_ * freqs_cis # [B, T, N_h, D_h//2]
+    # xq_out = torch.view_as_real(xq_out) #  [B, T, N_h, D_h//2, 2 ]
+    # xq_out = xq_out.flatten(3) #  [B, T, N_h, D_h]
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
@@ -98,7 +108,7 @@ class Attention(torch.nn.Module):
         self.n_kv_heads = config.n_kv_heads or config.n_heads
         self.repeat_factor = config.n_heads // self.n_kv_heads
 
-        self.wo = torch.nn.Linear(
+        self.wq = torch.nn.Linear(
             config.dim, config.n_heads * self.head_dim
         )  # (D, N_h*D_h)
         self.wk = torch.nn.Linear(
@@ -137,9 +147,11 @@ class Attention(torch.nn.Module):
         pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        B,
+        T,
+        D=x.shape,
     ):
-        B, T, D = x.shape
-        q = self.wo(x)  # (B,T,N_h*D_h)
+        q = self.wq(x)  # (B,T,N_h*D_h)
         k = self.wk(x)  # (B,T,N_kv*D_h)
         v = self.wv(x)  # (B,T,N_kv*D_h)
 

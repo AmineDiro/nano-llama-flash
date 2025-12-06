@@ -39,7 +39,16 @@ def attn_kernel(
     q_ptr = Q + batch_offset
     v_ptr = V + batch_offset
     o_ptr = O + batch_offset
-    k_ptr = K + batch_offset
+
+
+    k_block_ptr = tl.make_block_ptr(
+        base=K + batch_offset,
+        shape=(D, S),            # Transposed shape
+        strides=(stride_k_d, stride_k_s), 
+        offsets=(0, 0),          # Start at 0,0
+        block_shape=(D, Bc),     # Block size
+        order=(0, 1)             # Optimization order
+    )
 
     pid_x = tl.program_id(0) # Q Block ID
     
@@ -52,7 +61,15 @@ def attn_kernel(
     # Q Pointer arithmetic
     offset_i = (offs_m[:, None] * D) + offs_d[None, :]
     mask_q = offs_m < S
-    qi = tl.load(q_ptr + offset_i, mask=mask_q[:, None], other=0.0)
+    q_block_ptr = tl.make_block_ptr(
+        base=Q + batch_offset,     # Base pointer to the matrix start
+        shape=(S, D),              # Total Shape of the matrix
+        strides=(stride_H, 1),     # Strides (Row-major: stride_row, 1)
+        offsets=(pid_x * Bc, 0),   # Start offset for this block
+        block_shape=(Bc, D),       # The tile size you want to load (TMA Size)
+        order=(1, 0)               # Order of traversing (1=Row, 0=Col) for efficiency
+    )
+    qi = tl.load(q_block_ptr, boundary_check=(0, 1))
     
     # NOTE: for numerical stability bad idea to do softmax in fp16, bf16 could probably work but fp16 sucks
     prev_li = tl.zeros([Bc], dtype=tl.float32) + 1.0 # Init to 1.0 to avoid NaN
@@ -61,26 +78,19 @@ def attn_kernel(
 
     # NOTE: Pre-scale Q to save muls inside loop
     qi = qi * softmax_scale
+    qi_fp16 = qi.to(tl.float16)
 
     for j in range(0, Tc):
-        # K is physically (D, S). We want to load block (D, Bc). We need Rows 0..D and Cols j*Bc..+Bc
-        current_cols = j * Bc + tl.arange(0, Bc) # Iterate S dimension
-        
-        # Pointer Math: (Row_Idx * Stride_Row) + (Col_Idx * Stride_Col)
-        # Row_Idx is offs_d (0..D)
-        # Col_Idx is current_cols (S dimension)
-        offset_j_k = (offs_d[:, None] * stride_k_d) + (current_cols[None, :] * stride_k_s)
-        
-        # Load K (D, Bc) 
-        kj = tl.load(k_ptr + offset_j_k)
+        # Load in TMA
+        kj = tl.load(k_block_ptr, boundary_check=(0, 1))
 
         # Load V (Bc,D)
+        current_cols = j * Bc + tl.arange(0, Bc) # Iterate S dimension 
         offset_j_v = (current_cols[:, None] * D) + offs_d[None, :]
         vj = tl.load(v_ptr + offset_j_v)
 
         
         # NOTE: Cast to FP16 to trigger Tensor Cores
-        qi_fp16 = qi.to(tl.float16)
         kj_fp16 = kj.to(tl.float16)
         Sij = tl.dot(qi_fp16, kj_fp16)
 
@@ -105,6 +115,9 @@ def attn_kernel(
 
         prev_li = li_new
         prev_mi = mi_new
+
+        # advance pointer
+        k_block_ptr = tl.advance(k_block_ptr, (0, Bc))
 
     acc = acc / prev_li[:, None]
     
@@ -131,6 +144,37 @@ def compute_sram_need(Br, Bc, D_h):
     print(f"Shared Memory needed: {sram_needed} bytes")
 
 
+def check_tma():
+    # Print PTX to check for mma instructions
+    print("\n=== Checking for Tensor Core (mma) instructions in PTX ===")
+    #############################3
+    # Access the compiled kernel from cache
+    import glob
+    import os as os_module
+    cache_dir = os_module.path.expanduser("~/.triton/cache")
+    ptx_files = glob.glob(f"{cache_dir}/**/*.ptx", recursive=True)
+    if ptx_files:
+        # Get most recent PTX file
+        latest_ptx = max(ptx_files, key=os_module.path.getmtime)
+        with open(latest_ptx, 'r') as f:
+            ptx_content = f.read()
+        if "mma" in ptx_content:
+            print("✓ Found mma instructions - Tensor Cores ARE being used!")
+            for line in ptx_content.split('\n'):
+                if 'mma' in line:
+                    print(f"  {line.strip()}")
+        else:
+            print("✗ No mma instructions found - Tensor Cores NOT being used")
+            # Look for what dot product instructions are used
+            print("\nLooking for fma/mul instructions:")
+            for line in ptx_content.split('\n'):
+                if 'fma' in line.lower() or ('mul' in line.lower() and 'f16' in line.lower()):
+                    print(f"  {line.strip()}")
+                    break
+    else:
+        print("No PTX files found in cache")
+    #############################3
+
 def main():
     B = 10
     N_h = 64
@@ -155,23 +199,29 @@ def main():
     compute_sram_need(Br, Bc, D_h)
 
     print("=== profiling flash attention ===")
-    
+
     # Grid: (Number of Q blocks, Batch * Heads)
-    grid = (triton.cdiv(S, Bc), B * N_h) 
-    attn_kernel[grid](
-        q,
-        k_trans,
-        v,
-        o,
-        S,
-        q.stride(1),
-        stride_k_d,
-        stride_k_s,
-        1 / math.sqrt(D_h),
-        D_h,
-        Tc,
-        Bc,
-    )
+    grid = (triton.cdiv(S, Bc), B * N_h)
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        attn_kernel[grid](
+            q,
+            k_trans,
+            v,
+            o,
+            S,
+            q.stride(1),
+            stride_k_d,
+            stride_k_s,
+            1 / math.sqrt(D_h),
+            D_h,
+            Tc,
+            Bc,
+            num_warps=4,  # or 8. Critical for Tensor Core parallelization
+            num_stages=3  # Enables pipeline loading (async_copy)
+        )
+        check_tma() 
 
     if PROFILE :
         print("=== profiling reference simple attention ===")

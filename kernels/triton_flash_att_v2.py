@@ -15,9 +15,11 @@ from typing import Any
 import torch.nn.functional as F
 import torch
 import triton
+import os
 import triton.language as tl
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
+PROFILE = int(os.getenv("PROFILE",0)) ==1
 
 
 # NOTE: (@aminediro): This is based on the FlashAttention1 paper
@@ -132,8 +134,8 @@ def compute_sram_need(Br, Bc, D_h):
 def main():
     B = 10
     N_h = 64
-    S = 512
-    D_h = 128
+    S = 1024
+    D_h = 16
 
     q = torch.randn(B, N_h, S, D_h).cuda()
     v = torch.randn(B, N_h, S, D_h).cuda()
@@ -180,21 +182,25 @@ def main():
         D_h,
         Tc,
         Bc,
-        num_ctas=1,
-        num_warps=32,
-        num_stages=4,
+        # num_ctas=1,
+        # num_warps=32,
+        # num_stages=4,
     )
+
+    if PROFILE :
+        print("=== profiling reference simple attention ===")
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
-    # print("=== profiling reference simple attention ===")
-    # with torch.profiler.profile(
-    #     activities=[torch.profiler.ProfilerActivity.CUDA]
-    # ) as prof:
-    #     o_simple = simple_attn(q, k, v)
-    #
-    # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-    # assert torch.allclose(o, o_simple, atol=1e-6, rtol=1e-6)
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        o_simple = simple_attn(q, k, v)
+
+    if PROFILE :
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    
+    assert torch.allclose(o, o_simple, atol=1e-5, rtol=1e-5)
 
 
 main()

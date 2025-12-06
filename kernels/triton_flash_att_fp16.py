@@ -68,11 +68,13 @@ def attn_kernel(
             qi = tl.load(q_ptr + offset_i)  # shape (Br,Br) == (Bc,Bc)
 
             # Compute Sij on Chip Q_i * K_j.T / sqrt(D_h)
+            # (Bc,D)x (D,Bc)  = (32,64) x (64,32)
             Sij = tl.dot(qi, tl.trans(kj)) * softmax_scale  # (Bc,Br) == (Bc,Bc)
 
             # Rowmax(Sij): (Bc,)
             mij = tl.max(Sij, 1)
             pij = tl.exp(Sij - mij[:, None])  # (Bc,Bc)
+            pij =pij.to(tl.float16)
             lij = tl.sum(pij, 1)  # (Bc,)
 
             # Running maximum
@@ -117,18 +119,18 @@ def compute_sram_need(Br, Bc, D_h):
 
 
 def main():
-    B = 10
+    B = 512
     N_h = 64
-    S = 1024
-    D_h = 16
+    S = 64
+    D_h = 64
 
-    q = torch.randn(B, N_h, S, D_h).cuda()
-    v = torch.randn(B, N_h, S, D_h).cuda()
-    k = torch.randn(B, N_h, S, D_h).cuda()
+    q = torch.randn(B, N_h, S, D_h, dtype= torch.float16).cuda()
+    v = torch.randn(B, N_h, S, D_h, dtype= torch.float16).cuda()
+    k = torch.randn(B, N_h, S, D_h, dtype= torch.float16).cuda()
+
     o = torch.zeros_like(q)
-
-    l = torch.zeros(B, N_h, S).cuda()
-    m = torch.full((B, N_h, S), float("-inf")).cuda()
+    l = torch.zeros(B, N_h, S, dtype= torch.float16).cuda()
+    m = torch.full((B, N_h, S), float("-inf"), dtype=torch.float16).cuda()
 
     # flash attn block size
     Br = Bc = 32
@@ -147,7 +149,7 @@ def main():
         attn_kernel[(B, N_h)](
             q, k, v, o, S, D_h, Tc, Tr, Bc, Br, 1 / math.sqrt(D_h), l, m
         )
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -156,10 +158,10 @@ def main():
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CUDA]
     ) as prof:
+        # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
         o_simple = simple_attn(q, k, v)
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
-    assert torch.allclose(o, o_simple, atol=1e-5, rtol=1e-5)
 
+    assert torch.allclose(o, o_simple, atol=1e-3, rtol=1e-3)
 
 main()

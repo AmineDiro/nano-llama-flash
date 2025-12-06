@@ -1,3 +1,4 @@
+import os
 import math
 
 from typing import Any
@@ -8,6 +9,8 @@ import triton.language as tl
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
+PROFILE = int(os.getenv("PROFILE",0)) ==1
+
 
 # NOTE: (@aminediro): This is based on the FlashAttention1 paper
 @triton.jit
@@ -16,15 +19,15 @@ def attn_kernel(
     K,
     V,
     O,
-    S,
-    D: tl.constexpr,
-    Tc: tl.constexpr,
-    Tr: tl.constexpr,
+    stride_q_s, stride_q_d,  # Strides for Sequence and HeadDim
+    stride_k_d, stride_k_s,  # Note: K is transposed, so we need stride for D and S
+    stride_v_s, stride_v_d,
+    stride_o_s, stride_o_d,
+    l, m,
+    S: tl.constexpr, D: tl.constexpr,
+    Tc: tl.constexpr, Tr: tl.constexpr,
     Bc: tl.constexpr,
-    Br: tl.constexpr,
     softmax_scale,
-    l,
-    m,
 ):
     # We have Br threads for this program
     # Get the thread index
@@ -46,55 +49,80 @@ def attn_kernel(
     l_ptr = l + lm_batch_offset
     m_ptr = m + lm_batch_offset
 
+    offs_d = tl.arange(0, D)  # Iterate over D (Head Dim)
+    offs_m = tl.arange(0, Bc) # Iterate over S (Rows of Q, O, L, M)
+    offs_s = tl.arange(0, Bc) # Iterate over S (Cols of K, Rows V)
+
     # offset the batch*N_h, for each dim, skip to the next dim
     for j in range(0, Tc):
         # Load K_j, V_j from HBM to SRAM
-        # NOTE: STUPID mistake! the stride
-        offset_j = (j * Bc + tl.arange(0, Bc))[:, None] * D + tl.arange(0, D)[None, :]
-        kj = tl.load(k_ptr + offset_j)  # shape(Bc,Bc)
-        vj = tl.load(v_ptr + offset_j)  # shape(Bc,Bc)
+        k_cols = j * Bc + offs_s
+        # Pointer: Base + (Row_D * Stride_D) + (Col_S * Stride_S)
+        k_ptrs = k_ptr + (offs_d[:, None] * stride_k_d) + (k_cols[None, :] * stride_k_s)
+        kj = tl.load(k_ptrs) # Load (D, Bc)
+
+        # Load Bc rows  from V
+        v_rows = j * Bc + offs_s
+        v_ptrs = v_ptr + (v_rows[:, None] * stride_v_s) + (offs_d[None, :] * stride_v_d)
+        vj = tl.load(v_ptrs) # Load (Bc, D)
 
         # TODO: Run parallel loop
         for i in range(0, Tr):
-            # Load Q_i, O_i, l_i, m_i from HBM to SRAM
-            S_i_offset = i * Bc + tl.arange(0, Bc)
-            offset_i = (S_i_offset)[:, None] * D + tl.arange(0, D)[None, :]
+            
+            # Offsets for current Q block
+            q_rows = i * Bc + offs_m
+            
+            # --- Load O, L, M (Accumulators) ---
+            # O ptr: Base + (Row_S * Stride_S) + (Col_D * Stride_D)
+            o_ptrs = o_ptr + (q_rows[:, None] * stride_o_s) + (offs_d[None, :] * stride_o_d)
+            l_ptrs = l_ptr + q_rows
+            m_ptrs = m_ptr + q_rows
 
-            prev_oi = tl.load(o_ptr + offset_i)
-            prev_li = tl.load(l_ptr + S_i_offset)
-            prev_mi = tl.load(m_ptr + S_i_offset)
+            prev_oi = tl.load(o_ptrs)
+            prev_li = tl.load(l_ptrs)
+            prev_mi = tl.load(m_ptrs)
 
-            # Load the query block
-            qi = tl.load(q_ptr + offset_i)  # shape (Br,Br) == (Bc,Bc)
+            # --- Load Q ---
+            q_ptrs = q_ptr + (q_rows[:, None] * stride_q_s) + (offs_d[None, :] * stride_q_d)
+            qi = tl.load(q_ptrs) # Load (Bc, D)
 
-            # Compute Sij on Chip Q_i * K_j.T / sqrt(D_h)
-            Sij = tl.dot(qi, tl.trans(kj)) * softmax_scale  # (Bc,Br) == (Bc,Bc)
+            # --- Computation ---
+            # 1. Cast inputs to FP16 for Tensor Core HMMA
+            # Shape: (Bc, D) x (D, Bc) -> (Bc, Bc)
+            # qi_fp16 = qi.to(tl.float16)
+            # kj_fp16 = kj.to(tl.float16)
 
-            # Rowmax(Sij): (Bc,)
-            mij = tl.max(Sij, 1)
-            pij = tl.exp(Sij - mij[:, None])  # (Bc,Bc)
-            lij = tl.sum(pij, 1)  # (Bc,)
+            # 2. Dot Product
+            Sij = tl.dot(qi, kj) * softmax_scale
 
-            # Running maximum
+            # 3. Softmax Logic
+            mij = tl.max(Sij, 1) # Row max
+            pij = tl.exp(Sij - mij[:, None])
+            lij = tl.sum(pij, 1)
+
+            # 4. Update Running Statistics
             mi_new = tl.maximum(prev_mi, mij)
-
-            # Compute scaling factors using previous_max
+            
             alpha = tl.exp(prev_mi - mi_new)
             beta = tl.exp(mij - mi_new)
-
-            # Update running sum
+            
             li_new = prev_li * alpha + lij * beta
 
-            # Update the output block
+            # 5. Update Output
+            # Cast P and V to FP16 for second HMMA
+            # pij_fp16 = pij.to(tl.float16)
+            # vj_fp16 = vj.to(tl.float16)
+            # Weighted sum
+            
             oi_new = (
                 alpha[:, None] * prev_li[:, None] * prev_oi
-                + beta[:, None] * tl.dot(pij, vj)
+                + beta[:, None] * tl.dot(pij,vj)
             ) / li_new[:, None]
 
-            # Update in HBM
-            tl.store(o_ptr + offset_i, oi_new)
-            tl.store(m_ptr + S_i_offset, mi_new)
-            tl.store(l_ptr + S_i_offset, li_new)
+            # --- Store to HBM ---
+            tl.store(o_ptrs, oi_new) # Write back O
+            tl.store(m_ptrs, mi_new)
+            tl.store(l_ptrs, li_new)
 
 
 def simple_attn(q, k, v):
@@ -140,14 +168,21 @@ def main():
     print("=== profiling flash attention ===")
     # simple_time = triton.testing.do_bench(lambda: attn_kernel[(B, N_h)](q, k, v, o, S, D_h, Tc, Tr, Bc, Br, 1/math.sqrt(D_h), l, m), rep = 400)
     # print(f"Flash attention : {simple_time*1000:.2f}us")
-
+    k_trans = k.transpose(-1,-2).contiguous()
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CUDA]
     ) as prof:
         attn_kernel[(B, N_h)](
-            q, k, v, o, S, D_h, Tc, Tr, Bc, Br, 1 / math.sqrt(D_h), l, m
-        )
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        q, k_trans, v, o,
+        q.stride(2), q.stride(3),
+        k_trans.stride(2), k_trans.stride(3), # K strides: (stride_d, stride_s)
+        v.stride(2), v.stride(3),       
+        o.stride(2), o.stride(3),      
+        l, m,
+        S, D_h, Tc, Tr, Bc, 1 / math.sqrt(D_h)
+    )
+    if PROFILE :
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -157,9 +192,10 @@ def main():
         activities=[torch.profiler.ProfilerActivity.CUDA]
     ) as prof:
         o_simple = simple_attn(q, k, v)
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-
+    if PROFILE :
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
     assert torch.allclose(o, o_simple, atol=1e-5, rtol=1e-5)
+
 
 
 main()

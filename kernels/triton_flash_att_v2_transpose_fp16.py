@@ -1,12 +1,9 @@
 """
-FA1 implementation
-Issues:
-- Block Size Too Small (Bc=32) With Bc=32 and S=8192, you're doing 256 iterations of the loop. -> Large
-- At S=8192, cuBLAS is simply faster. Flash Attention's advantage appears when S > 16K. Memory bandwidth becomes the bottleneck
-- Missing Br Parameter: same block size for both rows (Q) and columns (K/V). The original FA1 uses different block. Typically Br should be larger than Bc for better performance.
 
-WINs:
-- At large S (> 4096) on RTX2070 Super, only the FA works. Torch OOMs
+NOTE: 
+- only supported on ampere > https://github.com/woct0rdho/triton-windows/blob/readme/README.md
+
+
 """
 import math
 from typing import Any

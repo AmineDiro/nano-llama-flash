@@ -19,7 +19,7 @@ import triton.language as tl
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 PROFILE = int(os.getenv("PROFILE", 0)) == 1
 
-@triton.jit
+@triton.jit(flags="-fmad=true")
 def attn_kernel(
     Q, K, V, O,
     S,
@@ -81,7 +81,7 @@ def attn_kernel(
 
         # Softmax
         mij = tl.max(Sij, 1)
-        pij = tl.exp(Sij - mij[:, None])
+        pij = tl.fast_exp(Sij - mij[:, None])
         lij = tl.sum(pij, 1)
 
         # Update Stats
@@ -127,7 +127,7 @@ def main():
     N_h = 64
     S = 1024
     # TODO: change to 64, 16 too small for TC
-    D_h = 16
+    D_h = 64
 
     q = torch.randn(B, N_h, S, D_h).cuda()
     v = torch.randn(B, N_h, S, D_h).cuda()
@@ -140,7 +140,7 @@ def main():
     stride_k_d = k_trans.stride(2) 
     stride_k_s = k_trans.stride(3)
 
-    Br = Bc = 32
+    Br = Bc = 64
     Tc = S // Bc
 
     compute_sram_need(Br, Bc, D_h)

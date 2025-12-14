@@ -1,3 +1,4 @@
+import os
 import math
 
 from typing import Any
@@ -7,6 +8,7 @@ import triton
 import triton.language as tl
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
+PROFILE = int(os.getenv("PROFILE", 0)) == 1
 
 
 # NOTE: (@aminediro): This is based on the FlashAttention1 paper
@@ -120,7 +122,7 @@ def main():
     B = 10
     N_h = 64
     S = 1024
-    D_h = 16
+    D_h = 32
 
     q = torch.randn(B, N_h, S, D_h).cuda()
     v = torch.randn(B, N_h, S, D_h).cuda()
@@ -147,7 +149,8 @@ def main():
         attn_kernel[(B, N_h)](
             q, k, v, o, S, D_h, Tc, Tr, Bc, Br, 1 / math.sqrt(D_h), l, m
         )
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    if PROFILE:
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -157,7 +160,8 @@ def main():
         activities=[torch.profiler.ProfilerActivity.CUDA]
     ) as prof:
         o_simple = simple_attn(q, k, v)
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    if PROFILE:
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
     assert torch.allclose(o, o_simple, atol=1e-5, rtol=1e-5)
 

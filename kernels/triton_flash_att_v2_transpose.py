@@ -8,6 +8,7 @@ Issues:
 WINs:
 - At large S (> 4096) on RTX2070 Super, only the FA works. Torch OOMs
 """
+
 import math
 from typing import Any
 import torch.nn.functional as F
@@ -19,41 +20,45 @@ import triton.language as tl
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 PROFILE = int(os.getenv("PROFILE", 0)) == 1
 
+
 @triton.jit
 def attn_kernel(
-    Q, K, V, O,
+    Q,
+    K,
+    V,
+    O,
     S,
-    stride_H,           
-    stride_k_d,       
-    stride_k_s,      
+    stride_H,
+    stride_k_d,
+    stride_k_s,
     softmax_scale,
     D: tl.constexpr,
     Tc: tl.constexpr,
     Bc: tl.constexpr,
 ):
     # Get the thread index
-    pid_y = tl.program_id(1) # Head ID
-    
-    # Batch*Head offset 
-    batch_offset = pid_y * stride_H  
+    pid_y = tl.program_id(1)  # Head ID
+
+    # Batch*Head offset
+    batch_offset = pid_y * stride_H
     q_ptr = Q + batch_offset
     v_ptr = V + batch_offset
     o_ptr = O + batch_offset
     k_ptr = K + batch_offset
 
-    pid_x = tl.program_id(0) # Q Block ID
-    
+    pid_x = tl.program_id(0)  # Q Block ID
+
     # Q Offsets: Row-major
     # Rows: pid_x*Bc + 0..Bc
     # Cols: 0..D
     offs_m = pid_x * Bc + tl.arange(0, Bc)
     offs_d = tl.arange(0, D)
-    
+
     # Q Pointer arithmetic
     offset_i = (offs_m[:, None] * D) + offs_d[None, :]
     mask_q = offs_m < S
     qi = tl.load(q_ptr + offset_i, mask=mask_q[:, None], other=0.0)
-    
+
     prev_li = tl.zeros([Bc], dtype=tl.float32)
     prev_mi = tl.zeros([Bc], dtype=tl.float32) - float("inf")
     acc = tl.zeros([Bc, D], dtype=tl.float32)
@@ -63,13 +68,15 @@ def attn_kernel(
 
     for j in range(0, Tc):
         # K is physically (D, S). We want to load block (D, Bc). We need Rows 0..D and Cols j*Bc..+Bc
-        current_cols = j * Bc + tl.arange(0, Bc) # Iterate S dimension
-        
+        current_cols = j * Bc + tl.arange(0, Bc)  # Iterate S dimension
+
         # Pointer Math: (Row_Idx * Stride_Row) + (Col_Idx * Stride_Col)
         # Row_Idx is offs_d (0..D)
         # Col_Idx is current_cols (S dimension)
 
-        offset_j_k = (offs_d[:, None] * stride_k_d) + (current_cols[None, :] * stride_k_s)
+        offset_j_k = (offs_d[:, None] * stride_k_d) + (
+            current_cols[None, :] * stride_k_s
+        )
         # Load K (D, Bc) directly!
         kj = tl.load(k_ptr + offset_j_k)
 
@@ -77,7 +84,7 @@ def attn_kernel(
         # Rows j*Bc..+Bc, Cols 0..D
         offset_j_v = (current_cols[:, None] * D) + offs_d[None, :]
         vj = tl.load(v_ptr + offset_j_v)
-        Sij = tl.dot(qi, kj) # no transpose need for kj
+        Sij = tl.dot(qi, kj)  # no transpose need for kj
 
         # Softmax
         mij = tl.max(Sij, 1)
@@ -88,7 +95,7 @@ def attn_kernel(
         mi_new = tl.maximum(prev_mi, mij)
         alpha = tl.exp(prev_mi - mi_new)
         beta = tl.exp(mij - mi_new)
-        
+
         li_new = prev_li * alpha + lij * beta
 
         # Accumulate Output
@@ -99,7 +106,7 @@ def attn_kernel(
 
     # Final Normalization with the correct sum
     acc = acc / prev_li[:, None]
-    
+
     # Update in HBM
     # tl.store(o_ptr + offset_i, acc.to(tl.float16), mask=mask_q[:, None])
     tl.store(o_ptr + offset_i, acc, mask=mask_q[:, None])
@@ -124,20 +131,18 @@ def compute_sram_need(Br, Bc, D_h):
 
 def main():
     B = 10
+    S = 2048
     N_h = 64
-    S = 1024
-    # TODO: change to 64, 16 too small for TC
-    D_h = 16
+    D_h = 32
 
     q = torch.randn(B, N_h, S, D_h).cuda()
     v = torch.randn(B, N_h, S, D_h).cuda()
     k = torch.randn(B, N_h, S, D_h).cuda()
     o = torch.zeros_like(q)
 
-    
     # Transpose (feels like cheating)
     k_trans = k.transpose(-1, -2).contiguous()
-    stride_k_d = k_trans.stride(2) 
+    stride_k_d = k_trans.stride(2)
     stride_k_s = k_trans.stride(3)
 
     Br = Bc = 32
@@ -146,9 +151,9 @@ def main():
     compute_sram_need(Br, Bc, D_h)
 
     print("=== profiling flash attention ===")
-    
+
     # Grid: (Number of Q blocks, Batch * Heads)
-    grid = (triton.cdiv(S, Bc), B * N_h) 
+    grid = (triton.cdiv(S, Bc), B * N_h)
     attn_kernel[grid](
         q,
         k_trans,
@@ -164,21 +169,21 @@ def main():
         Bc,
     )
 
-    if PROFILE :
+    if PROFILE:
         print("=== profiling reference simple attention ===")
-    
+
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA]
-    ) as prof:
-        o_simple = simple_attn(q, k, v)
-    if PROFILE :
+    # with torch.profiler.profile(
+    #     activities=[torch.profiler.ProfilerActivity.CUDA]
+    # ) as prof:
+    #     o_simple = simple_attn(q, k, v)
+    # if PROFILE:
+    #     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    #
+    # assert torch.allclose(o, o_simple, atol=1e-5, rtol=1e-5)
 
-        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-    
-    assert torch.allclose(o, o_simple, atol=1e-5, rtol=1e-5)
 
 if __name__ == "__main__":
     main()

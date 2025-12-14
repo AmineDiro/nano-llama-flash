@@ -19,7 +19,7 @@ import os
 import triton.language as tl
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
-PROFILE = int(os.getenv("PROFILE",0)) ==1
+PROFILE = int(os.getenv("PROFILE", 0)) == 1
 
 
 # NOTE: (@aminediro): This is based on the FlashAttention1 paper
@@ -79,7 +79,6 @@ def attn_kernel(
         vj = tl.load(v_ptr + offset_j)  # shape(Bc,Bc)
 
         # Compute Sij on Chip Q_i * K_j.T / sqrt(D_h)
-        # TODO: Run parallel loop
         Sij = tl.dot(qi, tl.trans(kj)) * softmax_scale  # (Bc,Br) == (Bc,Bc)
 
         # Rowmax(Sij): (Bc,)
@@ -134,8 +133,8 @@ def compute_sram_need(Br, Bc, D_h):
 def main():
     B = 10
     N_h = 64
-    S = 1024
-    D_h = 16
+    S = 2048
+    D_h = 64
 
     q = torch.randn(B, N_h, S, D_h).cuda()
     v = torch.randn(B, N_h, S, D_h).cuda()
@@ -187,7 +186,7 @@ def main():
         # num_stages=4,
     )
 
-    if PROFILE :
+    if PROFILE:
         print("=== profiling reference simple attention ===")
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -197,9 +196,9 @@ def main():
     ) as prof:
         o_simple = simple_attn(q, k, v)
 
-    if PROFILE :
+    if PROFILE:
         print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-    
+
     assert torch.allclose(o, o_simple, atol=1e-5, rtol=1e-5)
 
 

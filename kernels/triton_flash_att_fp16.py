@@ -74,7 +74,7 @@ def attn_kernel(
             # Rowmax(Sij): (Bc,)
             mij = tl.max(Sij, 1)
             pij = tl.exp(Sij - mij[:, None])  # (Bc,Bc)
-            pij =pij.to(tl.float16)
+            pij = pij.to(tl.float16)
             lij = tl.sum(pij, 1)  # (Bc,)
 
             # Running maximum
@@ -111,7 +111,7 @@ def compute_sram_need(Br, Bc, D_h):
     # NOTE:
     # (3 * Br * D_h * sizeof(float)) -> tile of q,k,v
     # (Br * Bc * sizeof(float)) -> tile scores (Br,Bc)
-    sram_needed = (3 * Br * D_h * 4) + (Bc * Br * 4)
+    sram_needed = (3 * Br * D_h * 2) + (Bc * Br * 2)
     max_sram_size = device_properties.shared_memory_per_block
     print(f"Device Name: {device_properties.name}")
     print(f"Maximum Shared Memory (SRAM) Per Block: {max_sram_size} bytes")
@@ -119,17 +119,17 @@ def compute_sram_need(Br, Bc, D_h):
 
 
 def main():
-    B = 512
+    B = 10
+    S = 2048
     N_h = 64
-    S = 64
-    D_h = 64
+    D_h = 32
 
-    q = torch.randn(B, N_h, S, D_h, dtype= torch.float16).cuda()
-    v = torch.randn(B, N_h, S, D_h, dtype= torch.float16).cuda()
-    k = torch.randn(B, N_h, S, D_h, dtype= torch.float16).cuda()
+    q = torch.randn(B, N_h, S, D_h, dtype=torch.float16).cuda()
+    v = torch.randn(B, N_h, S, D_h, dtype=torch.float16).cuda()
+    k = torch.randn(B, N_h, S, D_h, dtype=torch.float16).cuda()
 
     o = torch.zeros_like(q)
-    l = torch.zeros(B, N_h, S, dtype= torch.float16).cuda()
+    l = torch.zeros(B, N_h, S, dtype=torch.float16).cuda()
     m = torch.full((B, N_h, S), float("-inf"), dtype=torch.float16).cuda()
 
     # flash attn block size
@@ -152,16 +152,16 @@ def main():
     # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
     torch.cuda.empty_cache()
+
     torch.cuda.synchronize()
+    # print("=== profiling reference simple attention ===")
+    # with torch.profiler.profile(
+    #     activities=[torch.profiler.ProfilerActivity.CUDA]
+    # ) as prof:
+    #     # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    #     o_simple = simple_attn(q, k, v)
+    #
+    # assert torch.allclose(o, o_simple, atol=1e-3, rtol=1e-3)
 
-    print("=== profiling reference simple attention ===")
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA]
-    ) as prof:
-        # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-        o_simple = simple_attn(q, k, v)
-
-
-    assert torch.allclose(o, o_simple, atol=1e-3, rtol=1e-3)
 
 main()

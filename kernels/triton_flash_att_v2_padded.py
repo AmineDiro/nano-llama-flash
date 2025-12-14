@@ -88,9 +88,8 @@ def unpad_tensor_headdim(tensor, D_h):
     return tensor[..., :D_h]
 
 
-# NOTE: (@aminediro): This is based on the FlashAttention1 paper with padding fix
 @triton.jit
-def attn_kernel_padded(
+def attn_kernel(
     Q,
     K,
     V,
@@ -234,7 +233,7 @@ def flash_attn_padded(q, k, v, Bc=32):
     # Launch kernel
     grid = lambda META: (triton.cdiv(S, META["Bc"]), B * N_h)
 
-    attn_kernel_padded[grid](
+    attn_kernel[grid](
         q_padded,
         k_padded,
         v_padded,
@@ -258,14 +257,10 @@ def flash_attn_padded(q, k, v, Bc=32):
 
 
 def main():
-    B = 2
-    N_h = 2
+    B = 10
+    N_h = 64
     S = 1024
     D_h = 32
-
-    print("=" * 60)
-    print("FLASH ATTENTION WITH BANK CONFLICT FIX (PADDING)")
-    print("=" * 60)
 
     q = torch.randn(B, N_h, S, D_h).cuda()
     k = torch.randn(B, N_h, S, D_h).cuda()
@@ -276,15 +271,11 @@ def main():
     D_h_padded = compute_padded_headdim(D_h)
 
     compute_sram_need(Bc, Bc, D_h_padded)
-    print()
 
     # Run padded flash attention
     print("=== Running Padded Flash Attention ===")
     o = flash_attn_padded(q, k, v, Bc=Bc)
     torch.cuda.synchronize()
-
-    print(f"Output shape: {o.shape}")
-    print()
 
 
 if __name__ == "__main__":
